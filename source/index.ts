@@ -29,8 +29,6 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 
 	#intervalEnd = 0;
 
-	#lastExecutionTime = 0;
-
 	#intervalId?: NodeJS.Timeout;
 
 	#timeoutId?: NodeJS.Timeout;
@@ -180,6 +178,13 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 		return this.#strictTicks.length - this.#strictTicksStartIndex;
 	}
 
+	// Rolls the fixed window over to the next one. Tasks still running at the
+	// boundary occupy slots of the new window only when `carryoverIntervalCount`
+	// is enabled; otherwise the new window starts with its full cap.
+	#rollIntervalWindow(): void {
+		this.#intervalCount = this.#carryoverIntervalCount ? this.#pending : 0;
+	}
+
 	get #doesIntervalAllowAnother(): boolean {
 		if (this.#isIntervalIgnored) {
 			return true;
@@ -234,27 +239,31 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 			return false;
 		}
 
-		// Fixed window mode (original logic)
+		// Fixed window mode.
+		//
+		// When the queue goes idle the interval timer is torn down, but the
+		// remembered window (`#intervalEnd`/`#intervalCount`) is kept so that
+		// tasks re-enqueued before the boundary are still limited by the current
+		// window. Once the boundary has passed, the window is rolled over here:
+		// the new window is anchored at `now` and gets a fresh cap (minus tasks
+		// still pending when `carryoverIntervalCount` is enabled).
 		if (this.#intervalId === undefined) {
 			const delay = this.#intervalEnd - now;
-			if (delay < 0) {
-				// If the interval has expired while idle, check if we should enforce the interval
-				// from the last task execution. This ensures proper spacing between tasks even
-				// when the queue becomes empty and then new tasks are added.
-				if (this.#lastExecutionTime > 0) {
-					const timeSinceLastExecution = now - this.#lastExecutionTime;
-					if (timeSinceLastExecution < this.#interval) {
-						// Not enough time has passed since the last task execution
-						this.#createIntervalTimeout(this.#interval - timeSinceLastExecution);
-						return true;
-					}
-				}
 
-				// Enough time has passed or no previous execution, allow execution
-				this.#intervalCount = (this.#carryoverIntervalCount) ? this.#pending : 0;
+			if (delay <= 0) {
+				this.#rollIntervalWindow();
+				this.#intervalEnd = now + this.#interval;
 			} else {
-				// Act as the interval is pending
+				// Inside the remembered window. A full-cap window starts its
+				// interval timer directly; a window that still has slots left
+				// needs this timeout to wake the queue at the boundary, since
+				// the interval timer was stopped while idle.
 				this.#createIntervalTimeout(delay);
+
+				// The current window is still "paused" as far as the interval
+				// timer is concerned, so it must not be re-initialized (which
+				// would re-anchor the boundary). This does not block a free slot
+				// — the caller still checks `#doesIntervalAllowAnother`.
 				return true;
 			}
 		}
@@ -323,12 +332,16 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 					this.#scheduleRateLimitUpdate();
 				}
 
-				this.emit('active');
-				job();
-
+				// Anchor the new window's interval timer before emitting `active`,
+				// so a task that synchronously re-enqueues another task from the
+				// active handler observes the window already in progress instead
+				// of rolling over again and double-counting the slot.
 				if (canInitializeInterval) {
 					this.#initializeIntervalIfNeeded();
 				}
+
+				this.emit('active');
+				job();
 
 				taskStarted = true;
 			}
@@ -364,7 +377,13 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 				this.#clearIntervalTimer();
 			}
 
-			this.#intervalCount = this.#carryoverIntervalCount ? this.#pending : 0;
+			this.#rollIntervalWindow();
+
+			// Advance the remembered boundary by one window instead of anchoring
+			// at the (possibly late) tick time, keeping the fixed-window grid.
+			if (this.#intervalId) {
+				this.#intervalEnd += this.#interval;
+			}
 		}
 
 		this.#processQueue();
@@ -488,8 +507,6 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 
 						throw error;
 					}
-
-					this.#lastExecutionTime = Date.now();
 
 					let operation = function_({signal: options.signal});
 

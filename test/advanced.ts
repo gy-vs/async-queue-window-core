@@ -1102,6 +1102,175 @@ test('interval with carryoverIntervalCount after queue empty', async () => {
 	assert.ok(interval >= 90, `Interval was ${interval}ms, expected >= 90ms`);
 });
 
+test('fixed window resets to full cap after idle across the boundary (spread consumption)', async () => {
+	// With intervalCap > 1, the quota is consumed in separate bursts (queue goes
+	// briefly idle between them), and new tasks arrive right after the window
+	// boundary. The new window must have the full cap immediately instead of
+	// waiting for the timer anchored to the old window.
+	const queue = new PQueue({
+		interval: 200,
+		intervalCap: 3,
+	});
+
+	const starts: number[] = [];
+	const t0 = Date.now();
+	const task = () => async () => {
+		starts.push(Date.now() - t0);
+		await delay(8);
+	};
+
+	// Spread the first window's quota across two bursts
+	queue.add(task());
+	await delay(50);
+	queue.add(task());
+	queue.add(task());
+	await queue.onIdle();
+
+	// Cross the boundary shortly before adding again
+	await delay(240 - (Date.now() - t0));
+	const boundaryAdd = Date.now() - t0;
+	// Add cap + 1: the whole cap starts immediately, the overflow waits for
+	// the following window.
+	const secondWindow = [queue.add(task()), queue.add(task()), queue.add(task()), queue.add(task())];
+
+	// Three of the new window's tasks must start right away, without any extra
+	// interval wait. Generous tolerance absorbs scheduler jitter.
+	await delay(60);
+	const early = starts.filter(t => t >= boundaryAdd - 10 && t - boundaryAdd < 100);
+	assert.equal(early.length, 3, `Expected 3 immediate starts, got ${early.length}: ${JSON.stringify(starts)}`);
+
+	// The fourth task over cap must wait for the following window
+	await Promise.all(secondWindow);
+	const lateStart = starts.at(-1)!;
+	assert.ok(lateStart - boundaryAdd > 150, `Overflow task started only ${lateStart - boundaryAdd}ms after add, expected to wait for the next window`);
+});
+
+test('re-enqueuing before the boundary keeps the current window limit', async () => {
+	// When tasks are added while idle but still inside the remembered window,
+	// they must consume the remaining slots of that window and wait for the
+	// boundary instead of opening a fresh window.
+	const queue = new PQueue({
+		interval: 200,
+		intervalCap: 3,
+	});
+
+	const starts: number[] = [];
+	const t0 = Date.now();
+	const task = () => async () => {
+		starts.push(Date.now() - t0);
+		await delay(8);
+	};
+
+	// Exhaust the first window in spread-out bursts
+	queue.add(task());
+	await delay(50);
+	queue.add(task());
+	queue.add(task());
+	await queue.onIdle();
+
+	// Re-enqueue while still inside the first window (anchored at t≈0).
+	// Add cap + 1: all of them must wait for the t≈200 boundary, and the one
+	// over cap then waits for the following window.
+	await delay(130 - (Date.now() - t0));
+	const added = [queue.add(task()), queue.add(task()), queue.add(task()), queue.add(task())];
+
+	// Nothing can start before the t≈200 boundary
+	await delay(40);
+	assert.ok(starts.every(t => t < 120), `A task started at ${JSON.stringify(starts)} before the window boundary`);
+
+	// Right after the boundary the full cap allows starts.
+	await delay(90);
+	const afterBoundary = starts.filter(t => t >= 160 && t < 360);
+	assert.equal(afterBoundary.length, 3, `Expected 3 starts in the new window, got ${afterBoundary.length}: ${JSON.stringify(starts)}`);
+
+	await Promise.all(added);
+	assert.ok(starts.at(-1)! >= 380, `The task over cap must wait for the following window, starts: ${JSON.stringify(starts)}`);
+});
+
+test('tasks re-enqueued from the active handler get the same fixed window', async () => {
+	// A task synchronously adding another queue task from its `active` handler
+	// must not roll the window over a second time (which would have reset the
+	// count and let more than intervalCap tasks start in the window).
+	const queue = new PQueue({
+		interval: 200,
+		intervalCap: 2,
+	});
+
+	const starts: number[] = [];
+	const t0 = Date.now();
+	const task = () => async () => {
+		starts.push(Date.now() - t0);
+		await delay(8);
+	};
+
+	let activeWindowRolled = false;
+	queue.on('active', () => {
+		if (activeWindowRolled) {
+			return;
+		}
+
+		activeWindowRolled = true;
+
+		// Re-entrant add while the queue processes the first task of a fresh window
+		queue.add(task());
+	});
+
+	queue.add(task());
+	await queue.onIdle();
+
+	// The new window begins after the boundary. Adding three more tasks means
+	// only two may start in it even though the first one re-enqueues another.
+	await delay(210 - (Date.now() - t0));
+	const added = [queue.add(task()), queue.add(task()), queue.add(task())];
+
+	await delay(60);
+	const recent = starts.filter(t => t > 200 && t < 300);
+	assert.equal(recent.length, 2, `Expected exactly 2 starts in the fresh window, got ${recent.length}: ${JSON.stringify(starts)}`);
+	assert.equal(starts.length, 4, `Expected 4 total starts before the next boundary, got ${starts.length}`);
+
+	await Promise.all(added);
+});
+
+test('carryoverIntervalCount carries pending tasks into the fresh window after idle', async () => {
+	const queue = new PQueue({
+		interval: 200,
+		intervalCap: 3,
+		carryoverIntervalCount: true,
+	});
+
+	const starts: number[] = [];
+	const t0 = Date.now();
+
+	// Tasks still running when the boundary crosses occupy slots of the next window
+	const longTask = () => async () => {
+		starts.push(Date.now() - t0);
+		await delay(420);
+	};
+
+	const quickTask = () => async () => {
+		starts.push(Date.now() - t0);
+		await delay(8);
+	};
+
+	const longTasks = [queue.add(longTask()), queue.add(longTask())];
+
+	// Wait past the boundary (2 long tasks pending, carrying 2 of the 3 slots),
+	// then offer more tasks.
+	await delay(240);
+	const addTime = Date.now() - t0;
+	const quickAdds = [queue.add(quickTask()), queue.add(quickTask()), queue.add(quickTask())];
+
+	// Only one free slot exists in this window due to carryover
+	await delay(100);
+	const carriedWindowStarts = starts.filter(t => t >= addTime - 40 && t < addTime + 100);
+	assert.equal(carriedWindowStarts.length, 1, `Expected 1 start with carried slots, got ${carriedWindowStarts.length}: ${JSON.stringify(starts)}`);
+
+	await Promise.all([...longTasks, ...quickAdds]);
+
+	// The remaining quick tasks must be spread over subsequent windows
+	assert.ok(starts.at(-1)! - addTime > 150, `Tasks did not wait for following windows: ${JSON.stringify(starts)}`);
+});
+
 test('.setPriority() - execute a promise after planned', async () => {
 	const result: string[] = [];
 	const queue = new PQueue({concurrency: 1});
