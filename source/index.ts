@@ -29,8 +29,6 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 
 	#intervalEnd = 0;
 
-	#lastExecutionTime = 0;
-
 	#intervalId?: NodeJS.Timeout;
 
 	#timeoutId?: NodeJS.Timeout;
@@ -238,19 +236,8 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 		if (this.#intervalId === undefined) {
 			const delay = this.#intervalEnd - now;
 			if (delay < 0) {
-				// If the interval has expired while idle, check if we should enforce the interval
-				// from the last task execution. This ensures proper spacing between tasks even
-				// when the queue becomes empty and then new tasks are added.
-				if (this.#lastExecutionTime > 0) {
-					const timeSinceLastExecution = now - this.#lastExecutionTime;
-					if (timeSinceLastExecution < this.#interval) {
-						// Not enough time has passed since the last task execution
-						this.#createIntervalTimeout(this.#interval - timeSinceLastExecution);
-						return true;
-					}
-				}
-
-				// Enough time has passed or no previous execution, allow execution
+				// The window expired while the queue was idle: a fresh window
+				// starts now, so the full quota is restored immediately.
 				this.#intervalCount = (this.#carryoverIntervalCount) ? this.#pending : 0;
 			} else {
 				// Act as the interval is pending
@@ -323,12 +310,15 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 					this.#scheduleRateLimitUpdate();
 				}
 
-				this.emit('active');
-				job();
-
+				// Initialize the interval before emitting 'active' so that tasks
+				// added re-entrantly from an 'active' listener observe the fresh
+				// window instead of resetting its count a second time.
 				if (canInitializeInterval) {
 					this.#initializeIntervalIfNeeded();
 				}
+
+				this.emit('active');
+				job();
 
 				taskStarted = true;
 			}
@@ -360,6 +350,13 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 	#onInterval(): void {
 		// Non-strict mode uses interval timers and intervalCount
 		if (!this.#strict) {
+			// A live interval timer means a window boundary was just crossed.
+			// Keep `#intervalEnd` anchored to the upcoming boundary so that
+			// resuming from idle measures the remaining window correctly.
+			if (this.#intervalId !== undefined) {
+				this.#intervalEnd += this.#interval;
+			}
+
 			if (this.#intervalCount === 0 && this.#pending === 0 && this.#intervalId) {
 				this.#clearIntervalTimer();
 			}
@@ -488,8 +485,6 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 
 						throw error;
 					}
-
-					this.#lastExecutionTime = Date.now();
 
 					let operation = function_({signal: options.signal});
 
